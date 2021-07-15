@@ -8,6 +8,7 @@ interface Options {
     callee?: boolean;
     class?: string;
     export?: boolean;
+    classConstructor?: boolean;
 }
 
 interface ImportVariable {
@@ -119,6 +120,7 @@ export class LuaVisitor {
             //             this.result = `local __addonName, __addon = ...
             //             ${this.result}`;
             let prehambule = "";
+            let localPreamble = "";
             if (hasExportedVariables) {
                 let fullModuleName: string;
                 if (this.sourceFile.moduleName === "./index") {
@@ -152,6 +154,22 @@ if not __exports then return end
                 }
             }
 
+            if (this.imports.length > 0) {
+                /*
+                 * Only create the __imports table if we are importing
+                 * anything not from a global module.
+                 */
+                let hasImports = false;
+                for (const imp of this.imports) {
+                    if (globalModules[imp.module] === undefined) {
+                        hasImports = true;
+                        break;
+                    }
+                }
+                if (hasImports) {
+                    prehambule += "local __imports = {}\n";
+                }
+            }
             for (const imp of this.imports) {
                 let moduleVariableName: string;
                 if (imp.variables && imp.variables.every((x) => x.usages == 0))
@@ -180,25 +198,31 @@ if not __exports then return end
                         } else {
                             fullModuleName = `${this.appName}/${imp.path}`;
                         }
-                        prehambule += `local ${moduleVariableName} = LibStub:GetLibrary("${fullModuleName}")\n`;
+                        prehambule += `__imports.${moduleVariableName} = LibStub:GetLibrary("${fullModuleName}")\n`;
                     } else {
                         const extras = this.packageExtras.getExtras(imp.module);
                         let moduleName = extras.lua.name;
                         fullModuleName = `"${moduleName}"`;
                         if (extras.lua?.isGlobal) {
-                            prehambule += `local ${moduleVariableName} = ${moduleName}\n`;
-                        } else if (
-                            globalModules[imp.module] === ModuleType.WithObject
-                        ) {
-                            prehambule += `local ${moduleVariableName} = LibStub:GetLibrary(${fullModuleName})\n`;
+                            prehambule += `__imports.${moduleVariableName} = ${moduleName}\n`;
                         } else {
-                            prehambule += `local ${moduleVariableName} = LibStub:GetLibrary(${fullModuleName}, true)\n`;
+                            if (
+                                globalModules[imp.module] === ModuleType.WithObject
+                            ) {
+                                prehambule += `__imports.${moduleVariableName} = LibStub:GetLibrary(${fullModuleName})\n`;
+                            } else {
+                                prehambule += `__imports.${moduleVariableName} = LibStub:GetLibrary(${fullModuleName}, true)\n`;
+                            }
                         }
                         imp.isExternalLibraryImport = true;
                     }
                 } else {
                     moduleVariableName = imp.module.replace(/^@\w+\//, "");
                     imp.isExternalLibraryImport = true;
+                }
+                if (imp.variable) {
+                    // Namespace import
+                    localPreamble += `local ${imp.variable} = __imports.${moduleVariableName}\n`;
                 }
                 if (imp.variables) {
                     // Count usages because couldn't find how to filter out Interfaces or this kind of symbols
@@ -209,28 +233,34 @@ if not __exports then return end
                             imp.module === "@wowts/lua" &&
                             variable.name === "kpairs"
                         ) {
-                            prehambule += `local ${variable.alias} = pairs\n`;
+                            localPreamble += `local ${variable.alias} = pairs\n`;
                         } else if (
                             globalModules[imp.module] ===
                             ModuleType.WithoutObject
                         ) {
-                            prehambule += `local ${variable.alias} = ${variable.name}\n`;
+                            localPreamble += `local ${variable.alias} = ${variable.name}\n`;
+                        } else if (
+                            globalModules[imp.module] ===
+                            ModuleType.WithObject
+                        ) {
+                            localPreamble += `local ${variable.alias} = ${moduleVariableName}.${variable.name}\n`;
                         } else {
-                            prehambule += `local ${variable.alias} = ${moduleVariableName}.${variable.name}\n`;
+                            prehambule += `__imports.${variable.alias} = __imports.${moduleVariableName}.${variable.name}\n`;
+                            localPreamble += `local ${variable.alias} = __imports.${variable.alias}\n`;
                         }
                     }
                 }
             }
 
             if (hasForwardDeclaredFunctions) {
-                prehambule +=
+                localPreamble +=
                     Array.from(this.forwardUsedLocalSymbols)
                         .filter((x) => x[1])
                         .map(([s]) => `local ${s.name}`)
                         .join("\n") + "\n";
             }
 
-            this.result = prehambule + this.result;
+            this.result = prehambule + localPreamble + this.result;
         }
 
         return this.result;
@@ -961,6 +991,12 @@ if not __exports then return end
                             if (this.exports.indexOf(symbol) >= 0) {
                                 this.result += "__exports.";
                             } else if (
+                                importedVariable &&
+                                options &&
+                                options.classConstructor
+                            ) {
+                                this.result += "__imports.";
+                            } else if (
                                 importedVariable === undefined &&
                                 symbol.flags & ts.SymbolFlags.Function &&
                                 !this.forwardUsedLocalSymbols.has(symbol)
@@ -1106,7 +1142,9 @@ if not __exports then return end
 
             case ts.SyntaxKind.NewExpression:
                 const newExpression = <ts.NewExpression>node;
-                this.traverse(newExpression.expression, tabs, node);
+                this.traverse(newExpression.expression, tabs, node, {
+                    classConstructor: true,
+                });
                 this.result += "(";
                 if (newExpression.arguments)
                     this.writeArray(newExpression.arguments, tabs, node);
